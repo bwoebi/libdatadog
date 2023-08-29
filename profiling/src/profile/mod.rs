@@ -23,11 +23,11 @@ pub type TimestampedObservation = (Timestamp, Box<[i64]>);
 
 pub struct Profile {
     endpoints: Endpoints,
-    functions: FxIndexSet<Function>,
+    functions: Table<Function>,
     labels: FxIndexSet<Label>,
     label_sets: FxIndexSet<LabelSet>,
-    locations: FxIndexSet<Location>,
-    mappings: FxIndexSet<Mapping>,
+    locations: Table<Location>,
+    mappings: Table<Mapping>,
     observations: Observations,
     period: Option<(i64, ValueType)>,
     sample_types: Vec<ValueType>,
@@ -36,6 +36,7 @@ pub struct Profile {
     strings: StringTable,
     timestamp_key: StringId,
     upscaling_rules: UpscalingRules,
+    limits: api::Limits,
 }
 
 #[derive(Default)]
@@ -43,6 +44,7 @@ pub struct ProfileBuilder<'a> {
     period: Option<api::Period<'a>>,
     sample_types: Vec<api::ValueType<'a>>,
     start_time: Option<SystemTime>,
+    limits: Option<api::Limits>,
 }
 
 impl<'a> ProfileBuilder<'a> {
@@ -51,6 +53,7 @@ impl<'a> ProfileBuilder<'a> {
             period: None,
             sample_types: Vec::new(),
             start_time: None,
+            limits: None,
         }
     }
 
@@ -69,29 +72,42 @@ impl<'a> ProfileBuilder<'a> {
         self
     }
 
-    pub fn build(self) -> Profile {
-        let mut profile = Profile::new(self.start_time.unwrap_or_else(SystemTime::now));
+    pub fn limits(mut self, limits: api::Limits) -> Self {
+        self.limits = Some(limits);
+        self
+    }
 
-        profile.sample_types = self
+    pub fn build(self) -> anyhow::Result<Profile> {
+        let limits = match self.limits {
+            Some(l) => l,
+            None => anyhow::bail!("profile limits are required but were not given"),
+        };
+        let mut profile = Profile::new(self.start_time.unwrap_or_else(SystemTime::now), limits)?;
+
+        let sample_types: Result<Vec<ValueType>, _> = self
             .sample_types
             .iter()
-            .map(|vt| ValueType {
-                r#type: profile.intern(vt.r#type),
-                unit: profile.intern(vt.unit),
+            .map(|vt| -> anyhow::Result<ValueType> {
+                Ok(ValueType {
+                    r#type: profile.intern(vt.r#type)?,
+                    unit: profile.intern(vt.unit)?,
+                })
             })
             .collect();
+
+        profile.sample_types = sample_types?;
 
         if let Some(period) = self.period {
             profile.period = Some((
                 period.value,
                 ValueType {
-                    r#type: profile.intern(period.r#type.r#type),
-                    unit: profile.intern(period.r#type.unit),
+                    r#type: profile.intern(period.r#type.r#type)?,
+                    unit: profile.intern(period.r#type.unit)?,
                 },
             ));
         };
 
-        profile
+        Ok(profile)
     }
 }
 
@@ -125,36 +141,38 @@ impl Profile {
     ///  - "" (the empty string)
     ///  - "local root span id"
     ///  - "trace endpoint"
+    ///  - "end_timestamp_ns"
     /// All other fields are default.
-    pub fn new(start_time: SystemTime) -> Self {
+    pub fn new(start_time: SystemTime, limits: api::Limits) -> anyhow::Result<Self> {
         /* Do not use Profile's default() impl here or it will cause a stack
          * overflow, since that default impl calls this method.
          */
         let mut profile = Self {
             endpoints: Default::default(),
-            functions: Default::default(),
             labels: Default::default(),
             label_sets: Default::default(),
-            locations: Default::default(),
-            mappings: Default::default(),
             observations: Default::default(),
             period: None,
             sample_types: vec![],
             stack_traces: Default::default(),
             start_time,
-            strings: Default::default(),
+            functions: Table::with_arena_capacity(limits.functions_mem.get())?,
+            locations: Table::with_arena_capacity(limits.locations_mem.get())?,
+            mappings: Table::with_arena_capacity(limits.mappings_mem.get())?,
+            strings: StringTable::with_capacity(limits.strings_mem.get())?,
             timestamp_key: Default::default(),
             upscaling_rules: Default::default(),
+            limits,
         };
 
         // Ensure the empty string is the first inserted item and has a 0 id.
-        let _id = profile.intern("");
+        let _id = profile.intern("")?;
         debug_assert!(_id == StringId::ZERO);
 
-        profile.endpoints.local_root_span_id_label = profile.intern("local root span id");
-        profile.endpoints.endpoint_label = profile.intern("trace endpoint");
-        profile.timestamp_key = profile.intern("end_timestamp_ns");
-        profile
+        profile.endpoints.local_root_span_id_label = profile.intern("local root span id")?;
+        profile.endpoints.endpoint_label = profile.intern("trace endpoint")?;
+        profile.timestamp_key = profile.intern("end_timestamp_ns")?;
+        Ok(profile)
     }
 
     #[cfg(test)]
@@ -164,8 +182,8 @@ impl Profile {
 
     /// Interns the `str` as a string, returning the id in the string table.
     /// The empty string is guaranteed to have an id of [StringId::ZERO].
-    fn intern(&mut self, item: &str) -> StringId {
-        self.strings.insert(item)
+    fn intern(&mut self, item: &str) -> anyhow::Result<StringId> {
+        Ok(self.strings.insert(item)?)
     }
 
     pub fn builder<'a>() -> ProfileBuilder<'a> {
@@ -182,42 +200,42 @@ impl Profile {
             .expect("StackTraceId {st} to exist in profile")
     }
 
-    fn add_function(&mut self, function: &api::Function) -> FunctionId {
-        let name = self.intern(function.name);
-        let system_name = self.intern(function.system_name);
-        let filename = self.intern(function.filename);
+    fn add_function(&mut self, function: &api::Function) -> anyhow::Result<FunctionId> {
+        let name = self.intern(function.name)?;
+        let system_name = self.intern(function.system_name)?;
+        let filename = self.intern(function.filename)?;
 
         let start_line = function.start_line;
-        self.functions.dedup(Function {
+        Ok(self.functions.insert(Function {
             name,
             system_name,
             filename,
             start_line,
-        })
+        })?)
     }
 
-    fn add_location(&mut self, location: &api::Location) -> LocationId {
+    fn add_location(&mut self, location: &api::Location) -> anyhow::Result<LocationId> {
         let mapping_id = self.add_mapping(&location.mapping);
         let function_id = self.add_function(&location.function);
-        self.locations.dedup(Location {
-            mapping_id,
-            function_id,
+        Ok(self.locations.insert(Location {
+            mapping_id: mapping_id?,
+            function_id: function_id?,
             address: location.address,
             line: location.line,
-        })
+        })?)
     }
 
-    fn add_mapping(&mut self, mapping: &api::Mapping) -> MappingId {
+    fn add_mapping(&mut self, mapping: &api::Mapping) -> anyhow::Result<MappingId> {
         let filename = self.intern(mapping.filename);
         let build_id = self.intern(mapping.build_id);
 
-        self.mappings.dedup(Mapping {
+        Ok(self.mappings.insert(Mapping {
             memory_start: mapping.memory_start,
             memory_limit: mapping.memory_limit,
             file_offset: mapping.file_offset,
-            filename,
-            build_id,
-        })
+            filename: filename?,
+            build_id: build_id?,
+        })?)
     }
 
     pub fn add(&mut self, sample: api::Sample) -> anyhow::Result<()> {
@@ -234,9 +252,9 @@ impl Profile {
             .locations
             .iter()
             .map(|l| self.add_location(l))
-            .collect();
+            .collect::<Result<Vec<_>, _>>();
 
-        let stacktrace = self.add_stacktrace(locations);
+        let stacktrace = self.add_stacktrace(locations?);
         self.observations
             .add(Sample::new(labels, stacktrace), timestamp, sample.values);
         Ok(())
@@ -285,13 +303,16 @@ impl Profile {
                 continue;
             }
 
-            let key = self.intern(label.key);
+            let key = self.intern(label.key)?;
             let internal_label = if let Some(s) = label.str {
-                let str = self.intern(s);
+                let str = self.intern(s)?;
                 Label::str(key, str)
             } else {
                 let num = label.num;
-                let num_unit = label.num_unit.map(|s| self.intern(s));
+                let num_unit = match label.num_unit {
+                    None => None,
+                    Some(s) => Some(self.intern(s)?),
+                };
                 Label::num(key, num, num_unit)
             };
 
@@ -325,25 +346,24 @@ impl Profile {
         Ok((label_set_id, timestamp))
     }
 
-    fn extract_api_sample_types(&self) -> Option<Vec<api::ValueType>> {
-        let mut sample_types: Vec<api::ValueType> = Vec::with_capacity(self.sample_types.len());
-        for sample_type in self.sample_types.iter() {
-            sample_types.push(api::ValueType {
+    fn extract_api_sample_types(&self) -> Vec<api::ValueType> {
+        self.sample_types
+            .iter()
+            .map(|sample_type| api::ValueType {
                 r#type: self.get_string(sample_type.r#type),
                 unit: self.get_string(sample_type.unit),
             })
-        }
-        Some(sample_types)
+            .collect()
     }
 
     /// Resets all data except the sample types and period. Returns the
     /// previous Profile on success.
-    pub fn reset(&mut self, start_time: Option<SystemTime>) -> Option<Profile> {
+    pub fn reset(&mut self, start_time: Option<SystemTime>) -> anyhow::Result<Profile> {
         /* We have to map over the types because the order of the strings is
          * not generally guaranteed, so we can't just copy the underlying
          * structures.
          */
-        let sample_types: Vec<api::ValueType> = self.extract_api_sample_types()?;
+        let sample_types = self.extract_api_sample_types();
 
         let period = self.period.map(|t| api::Period {
             r#type: api::ValueType {
@@ -357,23 +377,31 @@ impl Profile {
             .sample_types(sample_types)
             .period(period)
             .start_time(start_time)
-            .build();
+            .limits(self.limits)
+            .build()?;
 
         std::mem::swap(&mut *self, &mut profile);
-        Some(profile)
+        Ok(profile)
     }
 
     /// Add the endpoint data to the endpoint mappings.
     /// The `endpoint` string will be interned.
-    pub fn add_endpoint(&mut self, local_root_span_id: u64, endpoint: Cow<str>) {
-        let interned_endpoint = self.intern(endpoint.as_ref());
+    pub fn add_endpoint(
+        &mut self,
+        local_root_span_id: u64,
+        endpoint: Cow<str>,
+    ) -> anyhow::Result<()> {
+        let interned_endpoint = self.intern(endpoint.as_ref())?;
 
         self.endpoints
             .mappings
             .insert(local_root_span_id, interned_endpoint);
+
+        Ok(())
     }
 
     pub fn add_endpoint_count(&mut self, endpoint: Cow<str>, value: i64) {
+        // todo: intern strings here
         self.endpoints
             .stats
             .add_endpoint_count(endpoint.into_owned(), value);
@@ -392,8 +420,8 @@ impl Profile {
             self.sample_types.len() - 1
         );
 
-        let label_name_id = self.intern(label_name);
-        let label_value_id = self.intern(label_value);
+        let label_name_id = self.intern(label_name)?;
+        let label_value_id = self.intern(label_value)?;
 
         let mut new_values_offset = offset_values.to_vec();
         new_values_offset.sort_unstable();
@@ -597,9 +625,9 @@ impl TryFrom<&Profile> for pprof::Profile {
                 .map(pprof::ValueType::from)
                 .collect(),
             samples,
-            mappings: to_pprof_vec(&profile.mappings),
-            locations: to_pprof_vec(&profile.locations),
-            functions: to_pprof_vec(&profile.functions),
+            mappings: profile.mappings.to_pprof_vec(),
+            locations: profile.locations.to_pprof_vec(),
+            functions: profile.functions.to_pprof_vec(),
             string_table: profile.strings.iter().map(String::from).collect(),
             time_nanos: profile
                 .start_time
@@ -618,28 +646,40 @@ impl TryFrom<&Profile> for pprof::Profile {
 mod api_test {
 
     use super::*;
+    use std::num::NonZeroUsize;
     use std::{borrow::Cow, collections::HashMap};
 
+    fn test_builder<'a>() -> ProfileBuilder<'a> {
+        const MIB: usize = 1024 * 1024;
+        Profile::builder().limits(api::Limits {
+            functions_mem: NonZeroUsize::new(MIB).unwrap(),
+            locations_mem: NonZeroUsize::new(MIB).unwrap(),
+            mappings_mem: NonZeroUsize::new(MIB).unwrap(),
+            strings_mem: NonZeroUsize::new(MIB).unwrap(),
+        })
+    }
+
     #[test]
-    fn interning() {
+    fn test_interning() -> anyhow::Result<()> {
         let sample_types = vec![api::ValueType {
             r#type: "samples",
             unit: "count",
         }];
-        let mut profiles = Profile::builder().sample_types(sample_types).build();
+        let mut profiles = test_builder().sample_types(sample_types).build()?;
 
         let expected_id = StringId::from_offset(profiles.interned_strings_count());
 
         let string = "a";
-        let id1 = profiles.intern(string);
-        let id2 = profiles.intern(string);
+        let id1 = profiles.intern(string)?;
+        let id2 = profiles.intern(string)?;
 
         assert_eq!(id1, id2);
         assert_eq!(id1, expected_id);
+        Ok(())
     }
 
     #[test]
-    fn api() {
+    fn test_api() -> anyhow::Result<()> {
         let sample_types = vec![
             api::ValueType {
                 r#type: "samples",
@@ -680,21 +720,20 @@ mod api_test {
             },
         ];
 
-        let mut profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile = test_builder().sample_types(sample_types).build()?;
         assert_eq!(profile.only_for_testing_num_aggregated_samples(), 0);
 
-        profile
-            .add(api::Sample {
-                locations,
-                values: vec![1, 10000],
-                labels: vec![],
-            })
-            .expect("add to succeed");
+        profile.add(api::Sample {
+            locations,
+            values: vec![1, 10000],
+            labels: vec![],
+        })?;
 
         assert_eq!(profile.only_for_testing_num_aggregated_samples(), 1);
+        Ok(())
     }
 
-    fn provide_distinct_locations() -> Profile {
+    fn provide_distinct_locations() -> anyhow::Result<Profile> {
         let sample_types = vec![api::ValueType {
             r#type: "samples",
             unit: "count",
@@ -766,7 +805,7 @@ mod api_test {
             labels,
         };
 
-        let mut profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile = test_builder().sample_types(sample_types).build()?;
         assert_eq!(profile.only_for_testing_num_aggregated_samples(), 0);
 
         profile.add(main_sample).expect("profile to not be full");
@@ -780,13 +819,13 @@ mod api_test {
             .add(timestamp_sample)
             .expect("profile to not be full");
         assert_eq!(profile.only_for_testing_num_timestamped_samples(), 1);
-        profile
+        Ok(profile)
     }
 
     #[test]
-    fn impl_from_profile_for_pprof_profile() {
-        let locations = provide_distinct_locations();
-        let profile = pprof::Profile::try_from(&locations).unwrap();
+    fn test_impl_from_profile_for_pprof_profile() -> anyhow::Result<()> {
+        let locations = provide_distinct_locations()?;
+        let profile = pprof::Profile::try_from(&locations)?;
 
         assert_eq!(profile.samples.len(), 3);
         assert_eq!(profile.mappings.len(), 1);
@@ -882,11 +921,12 @@ mod api_test {
         assert_eq!(label.num, 42);
         assert_eq!(str, "");
         assert_eq!(num_unit, "");
+        Ok(())
     }
 
     #[test]
-    fn reset() {
-        let mut profile = provide_distinct_locations();
+    fn test_reset() -> anyhow::Result<()> {
+        let mut profile = provide_distinct_locations()?;
         /* This set of asserts is to make sure it's a non-empty profile that we
          * are working with so that we can test that reset works.
          */
@@ -901,7 +941,7 @@ mod api_test {
         assert!(profile.endpoints.mappings.is_empty());
         assert!(profile.endpoints.stats.is_empty());
 
-        let prev = profile.reset(None).expect("reset to succeed");
+        let prev = profile.reset(None)?;
 
         // These should all be empty now
         assert!(profile.functions.is_empty());
@@ -920,25 +960,26 @@ mod api_test {
         // The string table should have at least the empty string.
         assert!(!profile.strings.is_empty());
         assert_eq!("", profile.get_string(StringId::ZERO));
+        Ok(())
     }
 
     #[test]
-    fn reset_period() {
+    fn test_reset_period() -> anyhow::Result<()> {
         /* The previous test (reset) checked quite a few properties already, so
          * this one will focus only on the period.
          */
-        let mut profile = provide_distinct_locations();
+        let mut profile = provide_distinct_locations()?;
 
         let period = (
             10_000_000,
             ValueType {
-                r#type: profile.intern("wall-time"),
-                unit: profile.intern("nanoseconds"),
+                r#type: profile.intern("wall-time")?,
+                unit: profile.intern("nanoseconds")?,
             },
         );
         profile.period = Some(period);
 
-        let prev = profile.reset(None).expect("reset to succeed");
+        let prev = profile.reset(None)?;
         assert_eq!(Some(period), prev.period);
 
         // Resolve the string values to check that they match (their string
@@ -947,16 +988,17 @@ mod api_test {
         assert_eq!(value, period.0);
         assert_eq!(profile.get_string(period_type.r#type), "wall-time");
         assert_eq!(profile.get_string(period_type.unit), "nanoseconds");
+        Ok(())
     }
 
     #[test]
-    fn adding_local_root_span_id_with_string_value_fails() {
+    fn test_adding_local_root_span_id_with_string_value_fails() -> anyhow::Result<()> {
         let sample_types = vec![api::ValueType {
             r#type: "wall-time",
             unit: "nanoseconds",
         }];
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let id_label = api::Label {
             key: "local root span id",
@@ -972,10 +1014,11 @@ mod api_test {
         };
 
         assert!(profile.add(sample).is_err());
+        Ok(())
     }
 
     #[test]
-    fn lazy_endpoints() {
+    fn test_lazy_endpoints() -> anyhow::Result<()> {
         let sample_types = vec![
             api::ValueType {
                 r#type: "samples",
@@ -987,7 +1030,7 @@ mod api_test {
             },
         ];
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let id_label = api::Label {
             key: "local root span id",
@@ -1022,13 +1065,13 @@ mod api_test {
             labels: vec![id2_label, other_label],
         };
 
-        profile.add(sample1).expect("add to success");
+        profile.add(sample1)?;
 
-        profile.add(sample2).expect("add to success");
+        profile.add(sample2)?;
 
-        profile.add_endpoint(10, Cow::from("my endpoint"));
+        profile.add_endpoint(10, Cow::from("my endpoint"))?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
         assert_eq!(serialized_profile.samples.len(), 2);
         let samples = serialized_profile.sorted_samples();
 
@@ -1086,10 +1129,11 @@ mod api_test {
 
         // The trace endpoint label shouldn't be added to second sample because the span id doesn't match
         assert_eq!(s2.labels.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn endpoint_counts_empty_test() {
+    fn test_endpoint_counts_empty_test() -> anyhow::Result<()> {
         let sample_types = vec![
             api::ValueType {
                 r#type: "samples",
@@ -1101,7 +1145,7 @@ mod api_test {
             },
         ];
 
-        let profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let encoded_profile = profile
             .serialize(None, None)
@@ -1109,10 +1153,11 @@ mod api_test {
 
         let endpoints_stats = encoded_profile.endpoints_stats;
         assert!(endpoints_stats.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn endpoint_counts_test() {
+    fn test_endpoint_counts_test() -> anyhow::Result<()> {
         let sample_types = vec![
             api::ValueType {
                 r#type: "samples",
@@ -1124,7 +1169,7 @@ mod api_test {
             },
         ];
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let one_endpoint = "my endpoint";
         profile.add_endpoint_count(Cow::from(one_endpoint), 1);
@@ -1133,9 +1178,7 @@ mod api_test {
         let second_endpoint = "other endpoint";
         profile.add_endpoint_count(Cow::from(second_endpoint), 1);
 
-        let encoded_profile = profile
-            .serialize(None, None)
-            .expect("Unable to encode/serialize the profile");
+        let encoded_profile = profile.serialize(None, None)?;
 
         let endpoints_stats = encoded_profile.endpoints_stats;
 
@@ -1146,16 +1189,17 @@ mod api_test {
         let expected_endpoints_stats = ProfiledEndpointsStats::from(count);
 
         assert_eq!(endpoints_stats, expected_endpoints_stats);
+        Ok(())
     }
 
     #[test]
-    fn local_root_span_id_label_cannot_occur_more_than_once() {
+    fn local_root_span_id_label_cannot_occur_more_than_once() -> anyhow::Result<()> {
         let sample_types = vec![api::ValueType {
             r#type: "wall-time",
             unit: "nanoseconds",
         }];
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let labels = vec![
             api::Label {
@@ -1179,10 +1223,11 @@ mod api_test {
         };
 
         profile.add(sample).unwrap_err();
+        Ok(())
     }
 
     #[test]
-    fn test_no_upscaling_if_no_rules() {
+    fn test_no_upscaling_if_no_rules() -> anyhow::Result<()> {
         let sample_types = vec![
             api::ValueType {
                 r#type: "samples",
@@ -1194,7 +1239,7 @@ mod api_test {
             },
         ];
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let id_label = api::Label {
             key: "my label",
@@ -1209,15 +1254,16 @@ mod api_test {
             labels: vec![id_label],
         };
 
-        profile.add(sample1).expect("add to success");
+        profile.add(sample1)?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
 
         assert_eq!(serialized_profile.samples.len(), 1);
         let first = serialized_profile.samples.get(0).expect("one sample");
 
         assert_eq!(first.values[0], 1);
         assert_eq!(first.values[1], 10000);
+        Ok(())
     }
 
     fn create_samples_types() -> Vec<api::ValueType<'static>> {
@@ -1247,10 +1293,10 @@ mod api_test {
     }
 
     #[test]
-    fn test_upscaling_by_value_a_zero_value() {
+    fn test_upscaling_by_value_a_zero_value() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile = test_builder().sample_types(sample_types).build()?;
 
         let sample1 = api::Sample {
             locations: vec![],
@@ -1258,27 +1304,26 @@ mod api_test {
             labels: vec![],
         };
 
-        profile.add(sample1).expect("add to success");
+        profile.add(sample1)?;
 
         let upscaling_info = UpscalingInfo::Proportional { scale: 2.0 };
         let values_offset = vec![0];
-        profile
-            .add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info)
-            .expect("Rule added");
+        profile.add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info)?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
 
         assert_eq!(serialized_profile.samples.len(), 1);
         let first = serialized_profile.samples.get(0).expect("one sample");
 
         assert_eq!(first.values, vec![0, 10000, 42]);
+        Ok(())
     }
 
     #[test]
-    fn test_upscaling_by_value_on_one_value() {
+    fn test_upscaling_by_value_on_one_value() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let sample1 = api::Sample {
             locations: vec![],
@@ -1286,27 +1331,26 @@ mod api_test {
             labels: vec![],
         };
 
-        profile.add(sample1).expect("add to success");
+        profile.add(sample1)?;
 
         let upscaling_info = UpscalingInfo::Proportional { scale: 2.7 };
         let values_offset = vec![0];
-        profile
-            .add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info)
-            .expect("Rule added");
+        profile.add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info)?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
 
         assert_eq!(serialized_profile.samples.len(), 1);
         let first = serialized_profile.samples.get(0).expect("one sample");
 
         assert_eq!(first.values, vec![3, 10000, 42]);
+        Ok(())
     }
 
     #[test]
-    fn test_upscaling_by_value_on_one_value_with_poisson() {
+    fn test_upscaling_by_value_on_one_value_with_poisson() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile = test_builder().sample_types(sample_types).build()?;
 
         let sample1 = api::Sample {
             locations: vec![],
@@ -1314,7 +1358,7 @@ mod api_test {
             labels: vec![],
         };
 
-        profile.add(sample1).expect("add to success");
+        profile.add(sample1)?;
 
         let upscaling_info = UpscalingInfo::Poisson {
             sum_value_offset: 1,
@@ -1322,23 +1366,22 @@ mod api_test {
             sampling_distance: 10,
         };
         let values_offset: Vec<usize> = vec![1];
-        profile
-            .add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info)
-            .expect("Rule added");
+        profile.add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info)?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
 
         assert_eq!(serialized_profile.samples.len(), 1);
         let first = serialized_profile.samples.get(0).expect("one sample");
 
         assert_eq!(first.values, vec![1, 298, 29]);
+        Ok(())
     }
 
     #[test]
-    fn test_upscaling_by_value_on_zero_value_with_poisson() {
+    fn test_upscaling_by_value_on_zero_value_with_poisson() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile = test_builder().sample_types(sample_types).build()?;
 
         let sample1 = api::Sample {
             locations: vec![],
@@ -1346,7 +1389,7 @@ mod api_test {
             labels: vec![],
         };
 
-        profile.add(sample1).expect("add to success");
+        profile.add(sample1)?;
 
         let upscaling_info = UpscalingInfo::Poisson {
             sum_value_offset: 1,
@@ -1354,23 +1397,22 @@ mod api_test {
             sampling_distance: 10,
         };
         let values_offset: Vec<usize> = vec![1];
-        profile
-            .add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info)
-            .expect("Rule added");
+        profile.add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info)?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
 
         assert_eq!(serialized_profile.samples.len(), 1);
         let first = serialized_profile.samples.get(0).expect("one sample");
 
         assert_eq!(first.values, vec![1, 16, 0]);
+        Ok(())
     }
 
     #[test]
-    fn test_cannot_add_a_rule_with_invalid_poisson_info() {
+    fn test_cannot_add_a_rule_with_invalid_poisson_info() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let sample1 = api::Sample {
             locations: vec![],
@@ -1378,7 +1420,7 @@ mod api_test {
             labels: vec![],
         };
 
-        profile.add(sample1).expect("add to success");
+        profile.add(sample1)?;
 
         // invalid sampling_distance vaue
         let upscaling_info = UpscalingInfo::Poisson {
@@ -1411,13 +1453,15 @@ mod api_test {
         profile
             .add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info3)
             .expect_err("Cannot add a rule if the offset y is invalid");
+
+        Ok(())
     }
 
     #[test]
-    fn test_upscaling_by_value_on_two_values() {
+    fn test_upscaling_by_value_on_two_values() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let sample1 = api::Sample {
             locations: vec![],
@@ -1448,18 +1492,16 @@ mod api_test {
             labels: vec![],
         };
 
-        profile.add(sample1).expect("add to success");
-        profile.add(sample2).expect("add to success");
+        profile.add(sample1)?;
+        profile.add(sample2)?;
 
         // upscale the first value and the last one
         let values_offset: Vec<usize> = vec![0, 2];
 
         let upscaling_info = UpscalingInfo::Proportional { scale: 2.0 };
-        profile
-            .add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info)
-            .expect("Rule added");
+        profile.add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info)?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
         let samples = serialized_profile.sorted_samples();
         let first = samples.get(0).expect("first sample");
 
@@ -1468,13 +1510,14 @@ mod api_test {
         let second = samples.get(1).expect("second sample");
 
         assert_eq!(second.values, vec![10, 24, 198]);
+        Ok(())
     }
 
     #[test]
-    fn test_upscaling_by_value_on_two_value_with_two_rules() {
+    fn test_upscaling_by_value_on_two_value_with_two_rules() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let sample1 = api::Sample {
             locations: vec![],
@@ -1504,15 +1547,13 @@ mod api_test {
             labels: vec![],
         };
 
-        profile.add(sample1).expect("add to success");
-        profile.add(sample2).expect("add to success");
+        profile.add(sample1)?;
+        profile.add(sample2)?;
 
         let mut values_offset: Vec<usize> = vec![0];
 
         let upscaling_info = UpscalingInfo::Proportional { scale: 2.0 };
-        profile
-            .add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info)
-            .expect("Rule added");
+        profile.add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info)?;
 
         // add another byvaluerule on the 3rd offset
         values_offset.clear();
@@ -1520,11 +1561,9 @@ mod api_test {
 
         let upscaling_info2 = UpscalingInfo::Proportional { scale: 5.0 };
 
-        profile
-            .add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info2)
-            .expect("Rule added");
+        profile.add_upscaling_rule(values_offset.as_slice(), "", "", upscaling_info2)?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
         let samples = serialized_profile.sorted_samples();
         let first = samples.get(0).expect("first sample");
 
@@ -1533,13 +1572,13 @@ mod api_test {
         let second = samples.get(1).expect("second sample");
 
         assert_eq!(second.values, vec![10, 24, 495]);
+        Ok(())
     }
-
     #[test]
-    fn test_no_upscaling_by_label_if_no_match() {
+    fn test_no_upscaling_by_label_if_no_match() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let id_label = create_label("my_label", Some("coco"));
 
@@ -1549,53 +1588,48 @@ mod api_test {
             labels: vec![id_label],
         };
 
-        profile.add(sample1).expect("add to success");
+        profile.add(sample1)?;
 
         let values_offset: Vec<usize> = vec![0];
 
         let upscaling_info = UpscalingInfo::Proportional { scale: 2.0 };
-        profile
-            .add_upscaling_rule(
-                values_offset.as_slice(),
-                "my label",
-                "foobar",
-                upscaling_info,
-            )
-            .expect("Rule added");
+        profile.add_upscaling_rule(
+            values_offset.as_slice(),
+            "my label",
+            "foobar",
+            upscaling_info,
+        )?;
 
         let upscaling_info2 = UpscalingInfo::Proportional { scale: 2.0 };
-        profile
-            .add_upscaling_rule(
-                values_offset.as_slice(),
-                "my other label",
-                "coco",
-                upscaling_info2,
-            )
-            .expect("Rule added");
+        profile.add_upscaling_rule(
+            values_offset.as_slice(),
+            "my other label",
+            "coco",
+            upscaling_info2,
+        )?;
 
         let upscaling_info3 = UpscalingInfo::Proportional { scale: 2.0 };
-        profile
-            .add_upscaling_rule(
-                values_offset.as_slice(),
-                "my other label",
-                "foobar",
-                upscaling_info3,
-            )
-            .expect("Rule added");
+        profile.add_upscaling_rule(
+            values_offset.as_slice(),
+            "my other label",
+            "foobar",
+            upscaling_info3,
+        )?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
 
         assert_eq!(serialized_profile.samples.len(), 1);
         let first = serialized_profile.samples.get(0).expect("one sample");
 
         assert_eq!(first.values, vec![1, 10000, 42]);
+        Ok(())
     }
 
     #[test]
-    fn test_upscaling_by_label_on_one_value() {
+    fn test_upscaling_by_label_on_one_value() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let id_label = create_label("my label", Some("coco"));
 
@@ -1605,32 +1639,31 @@ mod api_test {
             labels: vec![id_label],
         };
 
-        profile.add(sample1).expect("add to success");
+        profile.add(sample1)?;
 
         let upscaling_info = UpscalingInfo::Proportional { scale: 2.0 };
         let values_offset: Vec<usize> = vec![0];
-        profile
-            .add_upscaling_rule(
-                values_offset.as_slice(),
-                id_label.key,
-                id_label.str.unwrap(),
-                upscaling_info,
-            )
-            .expect("Rule added");
+        profile.add_upscaling_rule(
+            values_offset.as_slice(),
+            id_label.key,
+            id_label.str.unwrap(),
+            upscaling_info,
+        )?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
 
         assert_eq!(serialized_profile.samples.len(), 1);
         let first = serialized_profile.samples.get(0).expect("one sample");
 
         assert_eq!(first.values, vec![2, 10000, 42]);
+        Ok(())
     }
 
     #[test]
-    fn test_upscaling_by_label_on_only_sample_out_of_two() {
+    fn test_upscaling_by_label_on_only_sample_out_of_two() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let id_label = create_label("my label", Some("coco"));
 
@@ -1662,21 +1695,19 @@ mod api_test {
             labels: vec![],
         };
 
-        profile.add(sample1).expect("add to success");
-        profile.add(sample2).expect("add to success");
+        profile.add(sample1)?;
+        profile.add(sample2)?;
 
         let upscaling_info = UpscalingInfo::Proportional { scale: 2.0 };
         let values_offset: Vec<usize> = vec![0];
-        profile
-            .add_upscaling_rule(
-                values_offset.as_slice(),
-                id_label.key,
-                id_label.str.unwrap(),
-                upscaling_info,
-            )
-            .expect("Rule added");
+        profile.add_upscaling_rule(
+            values_offset.as_slice(),
+            id_label.key,
+            id_label.str.unwrap(),
+            upscaling_info,
+        )?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
         let samples = serialized_profile.sorted_samples();
 
         let first = samples.get(0).expect("one sample");
@@ -1686,13 +1717,15 @@ mod api_test {
         let second = samples.get(1).expect("one sample");
 
         assert_eq!(second.values, vec![5, 24, 99]);
+        Ok(())
     }
 
     #[test]
-    fn test_upscaling_by_label_with_two_different_rules_on_two_different_sample() {
+    fn test_upscaling_by_label_with_two_different_rules_on_two_different_sample(
+    ) -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let id_no_match_label = create_label("another label", Some("do not care"));
 
@@ -1733,35 +1766,31 @@ mod api_test {
             labels: vec![id_no_match_label, id_label2],
         };
 
-        profile.add(sample1).expect("add to success");
-        profile.add(sample2).expect("add to success");
+        profile.add(sample1)?;
+        profile.add(sample2)?;
 
         // add rule for the first sample on the 1st value
         let upscaling_info = UpscalingInfo::Proportional { scale: 2.0 };
         let mut values_offset: Vec<usize> = vec![0];
-        profile
-            .add_upscaling_rule(
-                values_offset.as_slice(),
-                id_label.key,
-                id_label.str.unwrap(),
-                upscaling_info,
-            )
-            .expect("Rule added");
+        profile.add_upscaling_rule(
+            values_offset.as_slice(),
+            id_label.key,
+            id_label.str.unwrap(),
+            upscaling_info,
+        )?;
 
         // add rule for the second sample on the 3rd value
         let upscaling_info2 = UpscalingInfo::Proportional { scale: 10.0 };
         values_offset.clear();
         values_offset.push(2);
-        profile
-            .add_upscaling_rule(
-                values_offset.as_slice(),
-                id_label2.key,
-                id_label2.str.unwrap(),
-                upscaling_info2,
-            )
-            .expect("Rule added");
+        profile.add_upscaling_rule(
+            values_offset.as_slice(),
+            id_label2.key,
+            id_label2.str.unwrap(),
+            upscaling_info2,
+        )?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
         let samples = serialized_profile.sorted_samples();
         let first = samples.get(0).expect("one sample");
 
@@ -1770,13 +1799,14 @@ mod api_test {
         let second = samples.get(1).expect("one sample");
 
         assert_eq!(second.values, vec![5, 24, 990]);
+        Ok(())
     }
 
     #[test]
-    fn test_upscaling_by_label_on_two_values() {
+    fn test_upscaling_by_label_on_two_values() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let id_label = create_label("my label", Some("coco"));
 
@@ -1786,33 +1816,32 @@ mod api_test {
             labels: vec![id_label],
         };
 
-        profile.add(sample1).expect("add to success");
+        profile.add(sample1)?;
 
         // upscale samples and wall-time values
         let values_offset: Vec<usize> = vec![0, 1];
 
         let upscaling_info = UpscalingInfo::Proportional { scale: 2.0 };
-        profile
-            .add_upscaling_rule(
-                values_offset.as_slice(),
-                id_label.key,
-                id_label.str.unwrap(),
-                upscaling_info,
-            )
-            .expect("Rule added");
+        profile.add_upscaling_rule(
+            values_offset.as_slice(),
+            id_label.key,
+            id_label.str.unwrap(),
+            upscaling_info,
+        )?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
 
         assert_eq!(serialized_profile.samples.len(), 1);
         let first = serialized_profile.samples.get(0).expect("one sample");
 
         assert_eq!(first.values, vec![2, 20000, 42]);
+        Ok(())
     }
     #[test]
-    fn test_upscaling_by_value_and_by_label_different_values() {
+    fn test_upscaling_by_value_and_by_label_different_values() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let id_label = create_label("my label", Some("coco"));
 
@@ -1822,47 +1851,42 @@ mod api_test {
             labels: vec![id_label],
         };
 
-        profile.add(sample1).expect("add to success");
+        profile.add(sample1)?;
 
         let upscaling_info = UpscalingInfo::Proportional { scale: 2.0 };
         let mut value_offsets: Vec<usize> = vec![0];
-        profile
-            .add_upscaling_rule(value_offsets.as_slice(), "", "", upscaling_info)
-            .expect("Rule added");
+        profile.add_upscaling_rule(value_offsets.as_slice(), "", "", upscaling_info)?;
 
         // a bylabel rule on the third offset
         let upscaling_info2 = UpscalingInfo::Proportional { scale: 5.0 };
         value_offsets.clear();
         value_offsets.push(2);
-        profile
-            .add_upscaling_rule(
-                value_offsets.as_slice(),
-                id_label.key,
-                id_label.str.unwrap(),
-                upscaling_info2,
-            )
-            .expect("Rule added");
+        profile.add_upscaling_rule(
+            value_offsets.as_slice(),
+            id_label.key,
+            id_label.str.unwrap(),
+            upscaling_info2,
+        )?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
 
         assert_eq!(serialized_profile.samples.len(), 1);
         let first = serialized_profile.samples.get(0).expect("one sample");
 
         assert_eq!(first.values, vec![2, 10000, 210]);
+        Ok(())
     }
 
     #[test]
-    fn test_add_same_byvalue_rule_twice() {
+    fn test_add_same_byvalue_rule_twice() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         // adding same offsets
         let upscaling_info = UpscalingInfo::Proportional { scale: 2.0 };
         let mut value_offsets: Vec<usize> = vec![0, 2];
-        profile
-            .add_upscaling_rule(value_offsets.as_slice(), "", "", upscaling_info)
-            .expect("Rule added");
+        profile.add_upscaling_rule(value_offsets.as_slice(), "", "", upscaling_info)?;
 
         let upscaling_info2 = UpscalingInfo::Proportional { scale: 2.0 };
         profile
@@ -1886,20 +1910,19 @@ mod api_test {
         profile
             .add_upscaling_rule(value_offsets.as_slice(), "", "", upscaling_info4)
             .expect_err("Duplicated rules");
+        Ok(())
     }
 
     #[test]
-    fn test_add_two_bylabel_rules_with_overlap_on_values() {
+    fn test_add_two_bylabel_rules_with_overlap_on_values() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         // adding same offsets
         let mut value_offsets: Vec<usize> = vec![0, 2];
         let upscaling_info = UpscalingInfo::Proportional { scale: 2.0 };
-        profile
-            .add_upscaling_rule(value_offsets.as_slice(), "my label", "coco", upscaling_info)
-            .expect("Rule added");
+        profile.add_upscaling_rule(value_offsets.as_slice(), "my label", "coco", upscaling_info)?;
         let upscaling_info2 = UpscalingInfo::Proportional { scale: 2.0 };
         profile
             .add_upscaling_rule(
@@ -1936,22 +1959,21 @@ mod api_test {
                 upscaling_info4,
             )
             .expect_err("Duplicated rules");
+        Ok(())
     }
 
     #[test]
-    fn test_fail_if_bylabel_rule_and_by_value_rule_with_overlap_on_values() {
+    fn test_fail_if_bylabel_rule_and_by_value_rule_with_overlap_on_values() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         // adding same offsets
         let mut value_offsets: Vec<usize> = vec![0, 2];
         let upscaling_info = UpscalingInfo::Proportional { scale: 2.0 };
 
         // add by value rule
-        profile
-            .add_upscaling_rule(value_offsets.as_slice(), "", "", upscaling_info)
-            .expect("Rule added");
+        profile.add_upscaling_rule(value_offsets.as_slice(), "", "", upscaling_info)?;
 
         // add by-label rule
         let upscaling_info2 = UpscalingInfo::Proportional { scale: 2.0 };
@@ -1990,13 +2012,14 @@ mod api_test {
                 upscaling_info4,
             )
             .expect_err("Duplicated rules");
+        Ok(())
     }
 
     #[test]
-    fn test_add_rule_with_offset_out_of_bound() {
+    fn test_add_rule_with_offset_out_of_bound() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         // adding same offsets
         let by_value_offsets: Vec<usize> = vec![0, 4];
@@ -2009,13 +2032,14 @@ mod api_test {
                 upscaling_info,
             )
             .expect_err("Invalid offset");
+        Ok(())
     }
 
     #[test]
-    fn test_add_rule_with_offset_out_of_bound_poisson_function() {
+    fn test_add_rule_with_offset_out_of_bound_poisson_function() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         // adding same offsets
         let by_value_offsets: Vec<usize> = vec![0, 4];
@@ -2032,13 +2056,14 @@ mod api_test {
                 upscaling_info,
             )
             .expect_err("Invalid offset");
+        Ok(())
     }
 
     #[test]
-    fn test_add_rule_with_offset_out_of_bound_poisson_function2() {
+    fn test_add_rule_with_offset_out_of_bound_poisson_function2() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         // adding same offsets
         let by_value_offsets: Vec<usize> = vec![0, 4];
@@ -2055,13 +2080,14 @@ mod api_test {
                 upscaling_info,
             )
             .expect_err("Invalid offset");
+        Ok(())
     }
 
     #[test]
-    fn test_add_rule_with_offset_out_of_bound_poisson_function3() {
+    fn test_add_rule_with_offset_out_of_bound_poisson_function3() -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         // adding same offsets
         let by_value_offsets: Vec<usize> = vec![0, 4];
@@ -2078,13 +2104,15 @@ mod api_test {
                 upscaling_info,
             )
             .expect_err("Invalid offset");
+        Ok(())
     }
 
     #[test]
-    fn test_fails_when_adding_byvalue_rule_collinding_on_offset_with_existing_bylabel_rule() {
+    fn test_fails_when_adding_byvalue_rule_collinding_on_offset_with_existing_bylabel_rule(
+    ) -> anyhow::Result<()> {
         let sample_types = create_samples_types();
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let id_label = create_label("my label", Some("coco"));
 
@@ -2094,19 +2122,17 @@ mod api_test {
             labels: vec![id_label],
         };
 
-        profile.add(sample1).expect("add to success");
+        profile.add(sample1)?;
 
         let mut value_offsets: Vec<usize> = vec![0, 1];
         // Add by-label rule first
         let upscaling_info2 = UpscalingInfo::Proportional { scale: 2.0 };
-        profile
-            .add_upscaling_rule(
-                value_offsets.as_slice(),
-                id_label.key,
-                id_label.str.unwrap(),
-                upscaling_info2,
-            )
-            .expect("Rule added");
+        profile.add_upscaling_rule(
+            value_offsets.as_slice(),
+            id_label.key,
+            id_label.str.unwrap(),
+            upscaling_info2,
+        )?;
 
         // add by-value rule
         let upscaling_info = UpscalingInfo::Proportional { scale: 2.0 };
@@ -2115,10 +2141,11 @@ mod api_test {
         profile
             .add_upscaling_rule(value_offsets.as_slice(), "", "", upscaling_info)
             .expect_err("Rule added");
+        Ok(())
     }
 
     #[test]
-    fn local_root_span_id_label_as_i64() {
+    fn local_root_span_id_label_as_i64() -> anyhow::Result<()> {
         let sample_types = vec![
             api::ValueType {
                 r#type: "samples",
@@ -2130,7 +2157,7 @@ mod api_test {
             },
         ];
 
-        let mut profile: Profile = Profile::builder().sample_types(sample_types).build();
+        let mut profile: Profile = test_builder().sample_types(sample_types).build()?;
 
         let id_label = api::Label {
             key: "local root span id",
@@ -2162,13 +2189,13 @@ mod api_test {
             labels: vec![id2_label],
         };
 
-        profile.add(sample1).expect("add to success");
-        profile.add(sample2).expect("add to success");
+        profile.add(sample1)?;
+        profile.add(sample2)?;
 
-        profile.add_endpoint(10, Cow::from("endpoint 10"));
-        profile.add_endpoint(large_span_id, Cow::from("large endpoint"));
+        profile.add_endpoint(10, Cow::from("endpoint 10"))?;
+        profile.add_endpoint(large_span_id, Cow::from("large endpoint"))?;
 
-        let serialized_profile = pprof::Profile::try_from(&profile).unwrap();
+        let serialized_profile = pprof::Profile::try_from(&profile)?;
         assert_eq!(serialized_profile.samples.len(), 2);
 
         // Find common label strings in the string table.
@@ -2221,5 +2248,6 @@ mod api_test {
         {
             assert_eq!(sample.labels, labels);
         }
+        Ok(())
     }
 }

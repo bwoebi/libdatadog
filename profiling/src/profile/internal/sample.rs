@@ -41,6 +41,10 @@ impl Id for SampleId {
         Self(index)
     }
 
+    fn to_offset(&self) -> usize {
+        self.0 as usize
+    }
+
     fn to_raw_id(&self) -> Self::RawId {
         self.0 as Self::RawId
     }

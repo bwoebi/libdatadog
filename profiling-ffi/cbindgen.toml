@@ -2,7 +2,9 @@
 # This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2021-Present Datadog, Inc.
 
 language = "C"
+line_length = 80
 tab_width = 2
+documentation = true
 header = """// Unless explicitly stated otherwise all files in this repository are licensed under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2021-Present Datadog, Inc."""
 include_guard = "DDOG_PROFILING_H"
@@ -34,14 +36,15 @@ renaming_overrides_prefixing = true
 
 "ExporterNewResult" = "ddog_prof_Exporter_NewResult"
 "File" = "ddog_prof_Exporter_File"
-"ProfileAddResult" = "ddog_prof_Profile_AddResult"
 "ProfileExporter" = "ddog_prof_Exporter"
+"ProfileLimits" = "ddog_prof_Profile_Limits"
+"ProfileNewResult" = "ddog_prof_Profile_NewResult"
+"ProfileResult" = "ddog_prof_Profile_Result"
 "Request" = "ddog_prof_Exporter_Request"
 "RequestBuildResult" = "ddog_prof_Exporter_Request_BuildResult"
 "SendResult" = "ddog_prof_Exporter_SendResult"
 "SerializeResult" = "ddog_prof_Profile_SerializeResult"
 "Slice_File" = "ddog_prof_Exporter_Slice_File"
-"UpscalingRuleAddResult" = "ddog_prof_Profile_UpscalingRuleAddResult"
 
 [export.mangle]
 rename_types = "PascalCase"

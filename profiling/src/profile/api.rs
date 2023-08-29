@@ -2,6 +2,7 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2021-Present Datadog, Inc.
 
 use crate::profile::pprof;
+use std::num::NonZeroUsize;
 use std::ops::{Add, Sub};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -389,4 +390,12 @@ mod test {
         };
         assert!(label.uses_at_most_one_of_str_and_num());
     }
+}
+
+#[derive(Copy, Clone)]
+pub struct Limits {
+    pub functions_mem: NonZeroUsize,
+    pub locations_mem: NonZeroUsize,
+    pub mappings_mem: NonZeroUsize,
+    pub strings_mem: NonZeroUsize,
 }

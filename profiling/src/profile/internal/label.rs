@@ -92,6 +92,10 @@ impl Id for LabelId {
         Self(index)
     }
 
+    fn to_offset(&self) -> usize {
+        self.0 as usize
+    }
+
     fn to_raw_id(&self) -> Self::RawId {
         self.0 as Self::RawId
     }
@@ -137,6 +141,10 @@ impl Id for LabelSetId {
     fn from_offset(inner: usize) -> Self {
         let index: u32 = inner.try_into().expect("LabelSetId to fit into a u32");
         Self(index)
+    }
+
+    fn to_offset(&self) -> usize {
+        self.0 as usize
     }
 
     fn to_raw_id(&self) -> Self::RawId {

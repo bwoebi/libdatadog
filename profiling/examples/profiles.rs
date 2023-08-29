@@ -3,10 +3,9 @@
 
 use datadog_profiling::profile::{api, Profile};
 use std::io::Write;
-use std::process::exit;
 
 // Keep this in-sync with profiles.c
-fn main() {
+fn main() -> anyhow::Result<()> {
     let walltime = api::ValueType {
         r#type: "wall-time",
         unit: "nanoseconds",
@@ -58,21 +57,15 @@ fn main() {
     let mut profile: Profile = Profile::builder()
         .sample_types(sample_types)
         .period(Some(period))
-        .build();
+        .build()?;
 
-    match profile.add(sample) {
-        Ok(_) => {}
-        Err(_) => exit(1),
-    }
+    profile.add(sample)?;
 
-    match profile.serialize(None, None) {
-        Ok(encoded_profile) => {
-            let buffer = &encoded_profile.buffer;
-            assert!(buffer.len() > 100);
-            std::io::stdout()
-                .write_all(buffer.as_slice())
-                .expect("write to succeed");
-        }
-        Err(_) => exit(1),
-    }
+    let encoded_profile = profile.serialize(None, None)?;
+
+    let buffer = &encoded_profile.buffer;
+    assert!(buffer.len() > 100);
+    std::io::stdout().write_all(buffer.as_slice())?;
+
+    Ok(())
 }

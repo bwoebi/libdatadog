@@ -2,39 +2,34 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2023-Present Datadog, Inc.
 
 use super::*;
-use bumpalo::Bump;
+
+use crate::alloc::AllocError;
 use ouroboros::self_referencing;
+use std::alloc::Layout;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
+
+use crate::alloc::ArenaAllocator;
 
 #[cfg(test)]
 use std::ops::Range;
 
-struct BorrowedStringTable<'b> {
+struct BorrowedStringTable<'a> {
     /// The arena to store the characters in.
-    arena: &'b Bump,
+    allocator: &'a ArenaAllocator,
 
     /// Used to have efficient lookup by [StringId], and to provide an
     /// [Iterator] over the strings.
-    vec: Vec<&'b str>,
+    vec: Vec<&'a str>,
 
     /// Used to have efficient lookup by [&str].
-    map: HashMap<&'b str, StringId, BuildHasherDefault<rustc_hash::FxHasher>>,
+    map: HashMap<&'a str, StringId, BuildHasherDefault<rustc_hash::FxHasher>>,
 }
 
 #[self_referencing]
 struct StringTableCell {
-    // This arena holds the characters of the strings. The memory used to hold
-    // the vec and map to implement the lookups required are not in the arena,
-    // because they would be re-allocated over time but the previous data
-    // wouldn't generally get reclaimed. This makes them a poor fit for an
-    // arena allocator.
-    owner: Bump,
+    owner: ArenaAllocator,
 
-    // This says that the BorrowedStringTable will hold a reference to the
-    // field `owner`. Rust does not allow this as there are many ways to make
-    // this code unsafe. The ouroboros crate is used to provide a safe
-    // abstraction for a subset of self-referential behavior.
     #[borrows(owner)]
     #[covariant]
     dependent: BorrowedStringTable<'this>,
@@ -50,59 +45,27 @@ pub struct StringTable {
 }
 
 impl StringTable {
-    // Not guaranteed for a given system, but a very common size.
-    const PAGE_SIZE: usize = 4096;
-
-    // not guaranteed, has a test to double-check.
-    const BUMP_OVERHEAD: usize = 64;
-
-    /// A good initial capacity for the [StringTable]. Used by
-    /// `[StringTable::new]` and its default impl.
-    ///
-    /// Ideally, we'd want the system allocator to allocate X pages. Pages are
-    /// the granularity that operating systems typically give out memory,
-    /// although some are definitely more efficient with larger number of
-    /// pages, and some have a concept of huge pages. The point is, it's hard
-    /// to totally generalize.
-    ///
-    /// However, we're not using a system allocator directly, we're using
-    /// [Bump], which has some overhead. So we need to subtract off some
-    /// overhead of whatever number we want, to avoid going into the next
-    /// size. The good news is that it rounds up to page sizes of 4096, so we
-    /// only need to get close.
-    ///
-    /// So, what remains is choosing how many pages to reserve up front. From
-    /// one perspective, it would be nice to use a size that goes directly to
-    /// `mmap` on Linux by a given malloc implementation, but if a certain
-    /// number of profiles don't reach that number, than that's wasteful. We
-    /// don't currently have metrics on this.
-    ///
-    /// So... for now, the selected number of pages is arbitrarily chosen.
-    pub const GOOD_INITIAL_CAPACITY: usize = 8 * Self::PAGE_SIZE - Self::BUMP_OVERHEAD;
-
+    /// Creates a new [StringTable] with the given max capacity, which may be
+    /// rounded up to a convenient number for the underlying allocator.
     #[inline]
-    pub fn new() -> Self {
-        Self::with_arena_capacity(Self::GOOD_INITIAL_CAPACITY)
-    }
+    pub fn with_capacity(capacity: usize) -> Result<Self, AllocError> {
+        let allocator = match ArenaAllocator::with_capacity(1, capacity) {
+            Ok(ok) => ok,
+            Err(_err) => return Err(AllocError),
+        };
 
-    /// Creates a new [StringTable] with an arena capacity of at least
-    /// `capacity` in bytes. Keep in mind that the other structures will also
-    /// use memory that is not included in this capacity.
-    #[inline]
-    fn with_arena_capacity(capacity: usize) -> Self {
-        let arena = Bump::with_capacity(capacity);
-        let inner = StringTableCell::new(arena, |arena| BorrowedStringTable {
-            arena,
+        let inner = StringTableCell::new(allocator, |allocator| BorrowedStringTable {
+            allocator,
             vec: Default::default(),
             map: Default::default(),
         });
 
         let mut s = Self { inner };
         // string tables always have the empty string at 0.
-        let (_id, _inserted) = s.insert_full("");
+        let (_id, _inserted) = s.insert_full("")?;
         debug_assert!(_id == StringId::ZERO);
         debug_assert!(_inserted);
-        s
+        Ok(s)
     }
 
     #[allow(unused)]
@@ -124,8 +87,8 @@ impl StringTable {
     /// Panics if a new string needs to be inserted but the offset of the new
     /// string doesn't fit into a [StringId].
     #[inline]
-    pub fn insert(&mut self, str: &str) -> StringId {
-        self.insert_full(str).0
+    pub fn insert(&mut self, str: &str) -> Result<StringId, AllocError> {
+        self.insert_full(str).map(|t| t.0)
     }
 
     /// Inserts the string into the table, if it did not already exist. The id
@@ -135,7 +98,7 @@ impl StringTable {
     /// Panics if a new string needs to be inserted but the offset of the new
     /// string doesn't fit into a [StringId].
     #[inline]
-    pub fn insert_full(&mut self, str: &str) -> (StringId, bool) {
+    pub fn insert_full(&mut self, str: &str) -> Result<(StringId, bool), AllocError> {
         // For performance, delay converting the &str to a String until after
         // it has been determined to not exist in the set. This avoids
         // temporary allocations.
@@ -143,14 +106,22 @@ impl StringTable {
             .with_dependent_mut(|table| match table.map.get(str) {
                 None => {
                     let id = StringId::from_offset(table.vec.len());
-                    let bumped_str = table.arena.alloc_str(str);
+                    let address = table.allocator.allocate(Layout::for_value(str))?;
+                    let dst = address.as_ptr() as *mut u8;
+                    unsafe { std::ptr::copy(str.as_ptr(), dst, str.len()) }
 
-                    table.vec.push(bumped_str);
-                    table.map.insert(bumped_str, id);
+                    // SAFETY: the allocator gave at least str.len() bytes.
+                    let v = unsafe { &address.as_ref()[..str.len()] };
+                    // SAFETY: the buffer was copied from a valid string, so
+                    // the copy must also be valid.
+                    let allocated_str = unsafe { std::str::from_utf8_unchecked(v) };
+
+                    table.vec.push(allocated_str);
+                    table.map.insert(allocated_str, id);
                     assert_eq!(table.vec.len(), table.map.len());
-                    (id, true)
+                    Ok((id, true))
                 }
-                Some(id) => (*id, false),
+                Some(id) => Ok((*id, false)),
             })
     }
 
@@ -183,39 +154,12 @@ impl StringTable {
     }
 }
 
-impl Default for StringTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// If this fails, Bumpalo may have changed its allocation patterns, and
-    /// [StringTable::new] and [StringTable::GOOD_INITIAL_CAPACITY] may need
-    /// adjusted. The test's purpose is to ensure that amount of memory
-    /// actually returned by Bumpalo matches our expectations.
     #[test]
-    fn test_bump() {
-        const BUMP_OVERHEAD: u64 = StringTable::BUMP_OVERHEAD as u64;
-        let given_capacity = StringTable::GOOD_INITIAL_CAPACITY as u64;
-        let actual_capacity = given_capacity.next_power_of_two() - BUMP_OVERHEAD;
-        let arena = Bump::with_capacity(given_capacity as usize);
-        assert_eq!(actual_capacity as usize, arena.chunk_capacity());
-    }
-
-    #[test]
-    fn owned_string_table() {
-        // small size, to allow testing re-alloc.
-        // todo: actually alloc more than this capacity due to Bump's rounding.
-        let mut set = StringTable::with_arena_capacity(64);
-
-        // the empty string must always be included in the set at 0.
-        let empty_str = set.get_id(StringId::ZERO);
-        assert_eq!("", empty_str);
-
+    fn owned_string_table() -> anyhow::Result<()> {
         let cases: &[_] = &[
             (StringId::ZERO, ""),
             (StringId::from_offset(1), "local root span id"),
@@ -231,23 +175,29 @@ mod tests {
             (StringId::from_offset(11), "pid"),
         ];
 
+        let capacity = cases.iter().map(|(_, str)| str.len()).sum();
+
+        let mut set = StringTable::with_capacity(capacity)?;
+
+        // the empty string must always be included in the set at 0.
+        let empty_str = set.get_id(StringId::ZERO);
+        assert_eq!("", empty_str);
+
         for (offset, str) in cases.iter() {
-            let actual_offset = set.insert(str);
+            let actual_offset = set.insert(str)?;
             assert_eq!(*offset, actual_offset);
         }
 
         // repeat them to ensure they aren't re-added
         for (offset, str) in cases.iter() {
-            let actual_offset = set.insert(str);
+            let actual_offset = set.insert(str)?;
             assert_eq!(*offset, actual_offset);
         }
 
-        // let's fetch some offsets
-        assert_eq!("", set.get_id(StringId::ZERO));
-        assert_eq!(
-            "/srv/demo/public/index.php",
-            set.get_id(StringId::from_offset(10))
-        );
+        // let's fetch by offset
+        for (id, expected_string) in cases.iter().cloned() {
+            assert_eq!(expected_string, set.get_id(id));
+        }
 
         // Check a range too
         let slice = set.get_range(7..10);
@@ -262,5 +212,6 @@ mod tests {
             .map(|(offset, item)| (StringId::from_offset(offset), item))
             .collect::<Vec<_>>();
         assert_eq!(cases, &actual);
+        Ok(())
     }
 }

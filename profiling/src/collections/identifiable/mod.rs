@@ -1,14 +1,16 @@
 // Unless explicitly stated otherwise all files in this repository are licensed under the Apache License Version 2.0.
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2023-Present Datadog, Inc.
 
-use std::hash::{BuildHasherDefault, Hash};
-use std::num::NonZeroU32;
-
 mod string_id;
 mod string_table;
+mod table;
 
 pub use string_id::*;
 pub use string_table::*;
+pub use table::*;
+
+use std::hash::{BuildHasherDefault, Hash};
+use std::num::NonZeroU32;
 
 pub type FxIndexMap<K, V> = indexmap::IndexMap<K, V, BuildHasherDefault<rustc_hash::FxHasher>>;
 pub type FxIndexSet<K> = indexmap::IndexSet<K, BuildHasherDefault<rustc_hash::FxHasher>>;
@@ -23,6 +25,10 @@ pub trait Id: Copy + Eq + Hash {
     /// the offset cannot fit in the underlying integer type. This is expected
     /// to be ultra-rare (more than u32::MAX-1 items created?!).
     fn from_offset(inner: usize) -> Self;
+
+    /// The logical inverse operation of [Id::from_offset] except that self
+    /// is borrowed, not owned.
+    fn to_offset(&self) -> usize;
 
     fn to_raw_id(&self) -> Self::RawId;
 

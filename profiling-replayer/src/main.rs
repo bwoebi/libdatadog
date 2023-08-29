@@ -152,7 +152,7 @@ fn main() -> anyhow::Result<()> {
         .start_time(Some(replayer.start_time))
         .sample_types(replayer.sample_types.clone())
         .period(replayer.period)
-        .build();
+        .build()?;
 
     // Before benchmarking, let's calculate some statistics.
     // No point doing that if there aren't at least 4 samples though.
@@ -193,7 +193,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     for (local_root_span_id, endpoint_value) in std::mem::take(&mut replayer.endpoints) {
-        outprof.add_endpoint(local_root_span_id, Cow::Borrowed(endpoint_value));
+        outprof.add_endpoint(local_root_span_id, Cow::Borrowed(endpoint_value))?;
     }
 
     println!("Replaying sample took {} ms", duration.as_millis());
