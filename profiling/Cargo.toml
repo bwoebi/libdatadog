@@ -30,8 +30,10 @@ libc = "0.2"
 lz4_flex = { version = "0.9", default-features = false, features = ["std", "safe-encode", "frame"] }
 mime = "0.3.16"
 mime_guess = {version = "2.0", default-features = false}
+ouroboros = {version = "0.17"}
 percent-encoding = "2.1"
 prost = "0.11"
+region = "3.0"
 rustc-hash = { version = "1.1", default-features = false }
 serde = {version = "1.0", features = ["derive"]}
 serde_json = {version = "1.0"}

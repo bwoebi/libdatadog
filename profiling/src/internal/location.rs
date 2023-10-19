@@ -49,6 +49,10 @@ impl Id for LocationId {
         Self(small_non_zero_pprof_id(offset).expect("LocationId to fit into a u32"))
     }
 
+    fn to_offset(&self) -> usize {
+        (self.0.get() - 1) as usize
+    }
+
     fn to_raw_id(&self) -> Self::RawId {
         self.0.get().into()
     }

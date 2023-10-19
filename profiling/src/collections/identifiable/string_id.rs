@@ -42,6 +42,10 @@ impl Id for StringId {
         Self::new(inner)
     }
 
+    fn to_offset(&self) -> usize {
+        self.0 as usize
+    }
+
     fn to_raw_id(&self) -> Self::RawId {
         Self::RawId::from(self.0)
     }

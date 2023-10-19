@@ -2,14 +2,18 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2023-Present Datadog, Inc.
 
 mod string_id;
+mod string_table;
+mod table;
+
+pub use string_id::*;
+pub use string_table::*;
+pub use table::*;
 
 use std::hash::{BuildHasherDefault, Hash};
 use std::num::NonZeroU32;
 
 pub type FxIndexMap<K, V> = indexmap::IndexMap<K, V, BuildHasherDefault<rustc_hash::FxHasher>>;
 pub type FxIndexSet<K> = indexmap::IndexSet<K, BuildHasherDefault<rustc_hash::FxHasher>>;
-
-pub use string_id::*;
 
 pub trait Id: Copy + Eq + Hash {
     type RawId;
@@ -21,6 +25,10 @@ pub trait Id: Copy + Eq + Hash {
     /// the offset cannot fit in the underlying integer type. This is expected
     /// to be ultra-rare (more than u32::MAX-1 items created?!).
     fn from_offset(inner: usize) -> Self;
+
+    /// The logical inverse operation of [Id::from_offset] except that self
+    /// is borrowed, not owned.
+    fn to_offset(&self) -> usize;
 
     fn to_raw_id(&self) -> Self::RawId;
 
@@ -73,6 +81,14 @@ impl<T: Item> Dedup<T> for FxIndexSet<T> {
         let (id, _) = self.insert_full(item);
         <T as Item>::Id::from_offset(id)
     }
+}
+
+pub fn to_pprof_vec<T: PprofItem>(collection: &FxIndexSet<T>) -> Vec<T::PprofMessage> {
+    collection
+        .iter()
+        .enumerate()
+        .map(|(index, item)| item.to_pprof(<T as Item>::Id::from_offset(index)))
+        .collect()
 }
 
 pub fn into_pprof_iter<T: PprofItem>(
