@@ -2,8 +2,10 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2023-Present Datadog, Inc.
 
 mod arena;
+mod table;
 
 pub use arena::*;
+pub use table::*;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct AllocError;

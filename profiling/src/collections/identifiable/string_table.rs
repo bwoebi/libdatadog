@@ -3,24 +3,22 @@
 
 use super::*;
 
-use crate::alloc::AllocError;
+use crate::alloc::{AllocError, TableReader, TableWriter};
 use ouroboros::self_referencing;
-use std::alloc::Layout;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
-
-use crate::alloc::ArenaAllocator;
+use std::mem::transmute;
 
 #[cfg(test)]
 use std::ops::Range;
 
 struct BorrowedStringTable<'a> {
     /// The arena to store the characters in.
-    allocator: &'a ArenaAllocator,
+    bytes: &'a TableWriter<u8>,
 
     /// Used to have efficient lookup by [StringId], and to provide an
     /// [Iterator] over the strings.
-    vec: Vec<&'a str>,
+    vec: TableWriter<&'a str>,
 
     /// Used to have efficient lookup by [&str].
     map: HashMap<&'a str, StringId, BuildHasherDefault<rustc_hash::FxHasher>>,
@@ -28,7 +26,7 @@ struct BorrowedStringTable<'a> {
 
 #[self_referencing]
 struct StringTableCell {
-    owner: ArenaAllocator,
+    owner: TableWriter<u8>,
 
     #[borrows(owner)]
     #[covariant]
@@ -44,19 +42,53 @@ pub struct StringTable {
     inner: StringTableCell,
 }
 
+pub struct BorrowedStringTableReader<'a> {
+    bytes_reader: &'a TableReader<u8>,
+    string_reader: TableReader<&'a str>,
+}
+
+#[self_referencing]
+pub struct StringTableReaderCell {
+    owner: TableReader<u8>,
+    #[borrows(owner)]
+    #[covariant]
+    dependent: TableReader<&'this str>,
+}
+
+unsafe impl Send for StringTableReaderCell {}
+
+pub struct StringTableReader {
+    cell: StringTableReaderCell,
+}
+
+impl StringTableReader {
+    pub unsafe fn new(reader: TableReader<u8>, string_reader: TableReader<&str>) -> Self {
+        let cell =
+            StringTableReaderCell::new(reader, |bytes_reader| unsafe { transmute(string_reader) });
+
+        StringTableReader { cell }
+    }
+
+    pub fn try_get_id(&self, id: StringId) -> anyhow::Result<&str> {
+        let string_reader = self.cell.borrow_dependent();
+        string_reader.try_fetch(id.to_offset() as u32).copied()
+    }
+}
+
 impl StringTable {
     /// Creates a new [StringTable] with the given max capacity, which may be
     /// rounded up to a convenient number for the underlying allocator.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Result<Self, AllocError> {
-        let allocator = match ArenaAllocator::with_capacity(1, capacity) {
+        let bytes = match TableWriter::new(capacity as u32) {
             Ok(ok) => ok,
             Err(_err) => return Err(AllocError),
         };
 
-        let inner = StringTableCell::new(allocator, |allocator| BorrowedStringTable {
-            allocator,
-            vec: Default::default(),
+        let inner = StringTableCell::new(bytes, |bytes| BorrowedStringTable {
+            bytes,
+            // todo: fix hard-coded number and panic
+            vec: TableWriter::new(4096).unwrap(),
             map: Default::default(),
         });
 
@@ -106,17 +138,13 @@ impl StringTable {
             .with_dependent_mut(|table| match table.map.get(str) {
                 None => {
                     let id = StringId::from_offset(table.vec.len());
-                    let address = table.allocator.allocate(Layout::for_value(str))?;
-                    let dst = address.as_ptr() as *mut u8;
-                    unsafe { std::ptr::copy(str.as_ptr(), dst, str.len()) }
+                    let slice = table.bytes.add_slice(str.as_bytes());
 
-                    // SAFETY: the allocator gave at least str.len() bytes.
-                    let v = unsafe { &address.as_ref()[..str.len()] };
                     // SAFETY: the buffer was copied from a valid string, so
                     // the copy must also be valid.
-                    let allocated_str = unsafe { std::str::from_utf8_unchecked(v) };
+                    let allocated_str = unsafe { std::str::from_utf8_unchecked(slice) };
 
-                    table.vec.push(allocated_str);
+                    table.vec.add(allocated_str);
                     table.map.insert(allocated_str, id);
                     assert_eq!(table.vec.len(), table.map.len());
                     Ok((id, true))
@@ -133,10 +161,17 @@ impl StringTable {
     pub fn get_id(&self, id: StringId) -> &str {
         self.inner.with_dependent(|table| {
             let offset = id.to_offset();
-            match table.vec.get(offset) {
-                Some(str) => str,
-                None => panic!("expected string id {offset} to exist in the string table"),
+            // todo: should this take by usize or..?
+            match table.vec.try_fetch(offset as u32) {
+                Ok(item) => *item,
+                Err(_) => panic!("expected string id {offset} to exist in the string table"),
             }
+        })
+    }
+
+    pub fn get_reader(&self) -> StringTableReader {
+        self.inner.with_dependent(|table| unsafe {
+            StringTableReader::new(table.bytes.reader(), table.vec.reader())
         })
     }
 
@@ -144,7 +179,12 @@ impl StringTable {
     #[allow(unused)]
     #[inline]
     pub fn get_range(&self, range: Range<usize>) -> &[&str] {
-        self.inner.with_dependent(|table| &table.vec[range])
+        self.inner.with_dependent(|table| {
+            table
+                .vec
+                .try_fetch_range(range.start as u32, (range.end - range.start) as u32)
+                .unwrap()
+        })
     }
 
     /// Returns an iterator over the strings in the table. The items are
@@ -212,6 +252,28 @@ mod tests {
             .map(|(offset, item)| (StringId::from_offset(offset), item))
             .collect::<Vec<_>>();
         assert_eq!(cases, &actual);
+        Ok(())
+    }
+
+    #[test]
+    fn test_reader() -> anyhow::Result<()> {
+        let mut strings = StringTable::with_capacity(1024)?;
+        let florian = strings.insert("Florian")?;
+        let levi = strings.insert("Levi")?;
+
+        let reader = strings.get_reader();
+        let handle = std::thread::spawn(move || {
+            let f = reader.try_get_id(florian).unwrap();
+            let l = reader.try_get_id(levi).unwrap();
+
+            assert_eq!("Florian", f);
+            assert_eq!("Levi", l);
+            ()
+        });
+
+        if let Err(err) = handle.join() {
+            anyhow::bail!("Failed to join: {err:?}")
+        }
         Ok(())
     }
 }
