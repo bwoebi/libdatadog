@@ -134,6 +134,7 @@ impl<T> TableWriter<T> {
         Ok(writer)
     }
 
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.table.len.load(Ordering::Relaxed) as usize
     }
@@ -141,7 +142,7 @@ impl<T> TableWriter<T> {
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         let len = self.table.len.load(Ordering::Acquire);
         let base = self.table.allocation.as_ptr::<T>();
-        unsafe { std::slice::from_raw_parts(base, len as usize) }.into_iter()
+        unsafe { std::slice::from_raw_parts(base, len as usize) }.iter()
     }
 
     pub fn reader(&self) -> TableReader<T> {
@@ -158,6 +159,12 @@ impl<T> TableWriter<T> {
     pub fn add_slice(&self, items: &[T]) -> &[T] {
         // SAFETY: Being called by a writer.
         unsafe { self.table.alloc_slice(items) }
+    }
+
+    pub fn at_watermark(&self, level: f64) -> bool {
+        let len = self.table.len.load(Ordering::Relaxed) as f64;
+        let capacity = self.table.allocation.len() as f64;
+        len / capacity >= level
     }
 
     #[inline(always)]

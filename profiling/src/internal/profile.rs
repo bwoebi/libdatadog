@@ -256,14 +256,13 @@ impl Profile {
         let mut encoder = CompressedProtobufSerializer::with_capacity(INITIAL_PPROF_BUFFER_SIZE);
 
         for (sample, timestamp, mut values) in std::mem::take(&mut self.observations).into_iter() {
-            let labels = self.translate_and_enrich_sample_labels(sample, timestamp)?;
+            let labels = self.translate_and_enrich_sample_labels(sample, &mut values, timestamp)?;
             let location_ids: Vec<_> = self
                 .get_stacktrace(sample.stacktrace)
                 .locations
                 .iter()
                 .map(Id::to_raw_id)
                 .collect();
-            self.upscaling_rules.upscale_values(&mut values, &labels)?;
 
             let item = pprof::Sample {
                 location_ids,
@@ -473,20 +472,29 @@ impl Profile {
     fn translate_and_enrich_sample_labels(
         &self,
         sample: Sample,
+        values: &mut [i64],
         timestamp: Option<Timestamp>,
     ) -> anyhow::Result<Vec<pprof::Label>> {
-        let labels: Vec<_> = self
+        // Begin with the label set.
+        let mut labels: Vec<_> = self
             .get_label_set(sample.labels)
             .iter()
-            .map(|l| self.get_label(*l).into())
-            .chain(
-                self.get_endpoint_for_labels(sample.labels)?
-                    .map(pprof::Label::from),
-            )
-            .chain(timestamp.map(|ts| Label::num(self.timestamp_key, ts.get(), None).into()))
+            .map(|l| *self.get_label(*l))
             .collect();
 
-        Ok(labels)
+        // Add endpoint information.
+        if let Some(label) = self.get_endpoint_for_labels(sample.labels)? {
+            labels.push(label);
+        }
+
+        // Add timestamp information.
+        if let Some(ts) = timestamp {
+            labels.push(Label::num(self.timestamp_key, ts.get(), None));
+        }
+
+        self.upscaling_rules.upscale_values(values, &labels)?;
+
+        Ok(labels.into_iter().map(pprof::Label::from).collect())
     }
 
     /// Validates labels

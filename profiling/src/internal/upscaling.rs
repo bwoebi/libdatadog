@@ -4,7 +4,7 @@
 use super::*;
 use crate::api::UpscalingInfo;
 use crate::collections::identifiable::FxIndexMap;
-use crate::pprof;
+use crate::internal;
 
 #[derive(Debug)]
 pub struct UpscalingRule {
@@ -157,13 +157,16 @@ impl UpscalingRules {
     pub fn upscale_values(
         &self,
         values: &mut [i64],
-        labels: &[pprof::Label],
+        labels: &[internal::Label],
     ) -> anyhow::Result<()> {
         if !self.is_empty() {
             // get bylabel rules first (if any)
             let mut group_of_rules = labels
                 .iter()
-                .filter_map(|label| self.get(&(StringId::new(label.key), StringId::new(label.str))))
+                .filter_map(|label| match label.get_value() {
+                    LabelValue::Str(str) => self.get(&(label.get_key(), *str)),
+                    LabelValue::Num { .. } => None,
+                })
                 .collect::<Vec<&Vec<UpscalingRule>>>();
 
             // get byvalue rules if any

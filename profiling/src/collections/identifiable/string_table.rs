@@ -42,13 +42,8 @@ pub struct StringTable {
     inner: StringTableCell,
 }
 
-pub struct BorrowedStringTableReader<'a> {
-    bytes_reader: &'a TableReader<u8>,
-    string_reader: TableReader<&'a str>,
-}
-
 #[self_referencing]
-pub struct StringTableReaderCell {
+struct StringTableReaderCell {
     owner: TableReader<u8>,
     #[borrows(owner)]
     #[covariant]
@@ -62,9 +57,9 @@ pub struct StringTableReader {
 }
 
 impl StringTableReader {
-    pub unsafe fn new(reader: TableReader<u8>, string_reader: TableReader<&str>) -> Self {
+    unsafe fn new(reader: TableReader<u8>, string_reader: TableReader<&str>) -> Self {
         let cell =
-            StringTableReaderCell::new(reader, |bytes_reader| unsafe { transmute(string_reader) });
+            StringTableReaderCell::new(reader, |_bytes_reader| unsafe { transmute(string_reader) });
 
         StringTableReader { cell }
     }
@@ -104,6 +99,12 @@ impl StringTable {
     #[inline]
     pub fn len(&self) -> usize {
         self.inner.with_dependent(|table| table.vec.len())
+    }
+
+    pub fn at_watermark(&self, level: f64) -> bool {
+        self.inner.with_dependent(|table| {
+            table.bytes.at_watermark(level) || table.vec.at_watermark(level)
+        })
     }
 
     #[allow(unused)]
@@ -268,7 +269,6 @@ mod tests {
 
             assert_eq!("Florian", f);
             assert_eq!("Levi", l);
-            ()
         });
 
         if let Err(err) = handle.join() {

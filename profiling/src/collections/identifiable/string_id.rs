@@ -15,13 +15,9 @@ impl StringId {
         Self(0)
     }
 
-    // todo: remove when upscaling uses internal::* instead of pprof::*
-    pub fn new<T>(v: T) -> Self
-    where
-        T: TryInto<u32>,
-        T::Error: core::fmt::Debug,
-    {
-        Self(v.try_into().expect("StringId to fit into a u32"))
+    #[inline]
+    pub const fn new(v: u32) -> Self {
+        Self(v)
     }
 
     #[inline]
@@ -39,7 +35,7 @@ impl Id for StringId {
     type RawId = i64;
 
     fn from_offset(inner: usize) -> Self {
-        Self::new(inner)
+        Self::new(inner.try_into().expect("StringId to fit into a u32"))
     }
 
     fn to_offset(&self) -> usize {
