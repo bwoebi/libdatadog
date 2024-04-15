@@ -50,7 +50,9 @@ use ddtelemetry::{
 };
 
 use crate::log::{MultiEnvFilterGuard, MultiWriterGuard};
-use crate::service::{RequestIdentification, RequestIdentifier, RuntimeMetadata, SidecarInterface};
+use crate::service::{
+    InstanceId, RequestIdentification, RequestIdentifier, RuntimeMetadata, SidecarInterface,
+};
 use crate::{config, log, tracer};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -77,24 +79,6 @@ impl<'a> From<TracerHeaderTags<'a>> for SerializedTracerHeaderTags {
     fn from(value: TracerHeaderTags<'a>) -> Self {
         SerializedTracerHeaderTags {
             data: bincode::serialize(&value).unwrap(),
-        }
-    }
-}
-
-#[derive(Default, Clone, Hash, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct InstanceId {
-    session_id: String,
-    runtime_id: String,
-}
-
-impl InstanceId {
-    pub fn new<T>(session_id: T, runtime_id: T) -> Self
-    where
-        T: Into<String>,
-    {
-        InstanceId {
-            session_id: session_id.into(),
-            runtime_id: runtime_id.into(),
         }
     }
 }
@@ -1224,9 +1208,9 @@ pub mod blocking {
 
     use crate::interface::{SerializedTracerHeaderTags, SessionConfig, SidecarAction};
 
-    use super::{InstanceId, QueueId, RuntimeMetadata};
+    use super::{QueueId, RuntimeMetadata};
 
-    use crate::service::{SidecarInterfaceRequest, SidecarInterfaceResponse};
+    use crate::service::{InstanceId, SidecarInterfaceRequest, SidecarInterfaceResponse};
 
     pub type SidecarTransport =
         BlockingTransport<SidecarInterfaceResponse, SidecarInterfaceRequest>;

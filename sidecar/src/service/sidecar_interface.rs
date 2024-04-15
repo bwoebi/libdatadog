@@ -1,7 +1,5 @@
-use super::{RequestIdentification, RequestIdentifier, RuntimeMetadata};
-use crate::interface::{
-    InstanceId, QueueId, SerializedTracerHeaderTags, SessionConfig, SidecarAction,
-};
+use super::{InstanceId, RequestIdentification, RequestIdentifier, RuntimeMetadata};
+use crate::interface::{QueueId, SerializedTracerHeaderTags, SessionConfig, SidecarAction};
 use anyhow::Result;
 use datadog_ipc::platform::ShmHandle;
 use datadog_ipc::tarpc;

@@ -1,4 +1,4 @@
-use crate::interface::InstanceId;
+use super::InstanceId;
 
 pub trait RequestIdentification {
     fn extract_identifier(&self) -> RequestIdentifier;
