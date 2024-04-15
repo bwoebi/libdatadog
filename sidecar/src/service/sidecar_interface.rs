@@ -1,6 +1,6 @@
-use super::request_identification::{RequestIdentification, RequestIdentifier};
+use super::{RequestIdentification, RequestIdentifier, RuntimeMetadata};
 use crate::interface::{
-    InstanceId, QueueId, RuntimeMeta, SerializedTracerHeaderTags, SessionConfig, SidecarAction,
+    InstanceId, QueueId, SerializedTracerHeaderTags, SessionConfig, SidecarAction,
 };
 use anyhow::Result;
 use datadog_ipc::platform::ShmHandle;
@@ -18,7 +18,7 @@ pub trait SidecarInterface {
     async fn register_service_and_flush_queued_actions(
         instance_id: InstanceId,
         queue_id: QueueId,
-        meta: RuntimeMeta,
+        meta: RuntimeMetadata,
         service_name: String,
         env_name: String,
     );
