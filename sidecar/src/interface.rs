@@ -27,7 +27,6 @@ use manual_future::{ManualFuture, ManualFutureCompleter};
 
 use datadog_ipc::platform::{FileBackedHandle, NamedShmHandle, ShmHandle};
 use datadog_ipc::tarpc::{context::Context, server::Channel};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, VecSkipError};
 use tokio::select;
@@ -51,7 +50,7 @@ use ddtelemetry::{
 
 use crate::log::{MultiEnvFilterGuard, MultiWriterGuard};
 use crate::service::{
-    InstanceId, RequestIdentification, RequestIdentifier, RuntimeMetadata, SidecarInterface,
+    InstanceId, RequestIdentification, RequestIdentifier, RuntimeMetadata, SidecarInterface, QueueId
 };
 use crate::{config, log, tracer};
 
@@ -83,19 +82,6 @@ impl<'a> From<TracerHeaderTags<'a>> for SerializedTracerHeaderTags {
     }
 }
 
-#[derive(Default, Copy, Clone, Hash, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[repr(transparent)]
-pub struct QueueId {
-    inner: u64,
-}
-
-impl QueueId {
-    pub fn new_unique() -> Self {
-        Self {
-            inner: rand::thread_rng().gen_range(1u64..u64::MAX),
-        }
-    }
-}
 
 #[derive(Default, Clone)]
 struct SessionInfo {
