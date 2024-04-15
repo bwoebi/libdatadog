@@ -20,7 +20,9 @@ mod unix;
 #[cfg(unix)]
 pub use unix::*;
 
+mod service;
 #[cfg(windows)]
 mod windows;
+
 #[cfg(windows)]
 pub use self::windows::*;
