@@ -85,21 +85,24 @@ impl ConnStream {
         uri: hyper::Uri,
         require_tls: bool,
     ) -> impl Future<Output = Result<ConnStream, ConnStreamError>> {
-        c.call(uri.to_string().parse().unwrap()).and_then(move |stream| match stream {
-            // move only require_tls
-            hyper_rustls::MaybeHttpsStream::Http(t) => {
-                if require_tls {
-                    future::ready(Err(
-                        super::errors::Error::CannotEstablishTlsConnection.into()
-                    ))
-                } else {
-                    future::ready(Ok(ConnStream::Tcp { transport: t.into_inner() }))
+        c.call(uri.to_string().parse().unwrap())
+            .and_then(move |stream| match stream {
+                // move only require_tls
+                hyper_rustls::MaybeHttpsStream::Http(t) => {
+                    if require_tls {
+                        future::ready(Err(
+                            super::errors::Error::CannotEstablishTlsConnection.into()
+                        ))
+                    } else {
+                        future::ready(Ok(ConnStream::Tcp {
+                            transport: t.into_inner(),
+                        }))
+                    }
                 }
-            }
-            hyper_rustls::MaybeHttpsStream::Https(t) => future::ready(Ok(ConnStream::Tls {
-                transport: Box::from(t.into_inner()),
-            })),
-        })
+                hyper_rustls::MaybeHttpsStream::Https(t) => future::ready(Ok(ConnStream::Tls {
+                    transport: Box::from(t.into_inner()),
+                })),
+            })
     }
 }
 

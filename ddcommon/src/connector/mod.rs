@@ -6,11 +6,11 @@ use futures::{future, FutureExt};
 use hyper::client::HttpConnector;
 
 use lazy_static::lazy_static;
+use rustls::pki_types::CertificateDer;
 use rustls::ClientConfig;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use rustls::pki_types::CertificateDer;
 
 #[cfg(unix)]
 pub mod uds;
@@ -70,7 +70,8 @@ impl Connector {
 }
 
 fn build_https_connector(
-) -> anyhow::Result<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>> {
+) -> anyhow::Result<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>>
+{
     let certs = load_root_certs()?;
     let client_config = ClientConfig::builder()
         .with_root_certificates(certs)
