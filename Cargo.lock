@@ -1333,6 +1333,7 @@ dependencies = [
  "percent-encoding",
  "serde_json",
  "tokio",
+ "tokio-util 0.7.10",
  "uuid",
 ]
 
@@ -4715,6 +4716,8 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
+ "hashbrown 0.14.3",
  "pin-project-lite",
  "slab",
  "tokio",
