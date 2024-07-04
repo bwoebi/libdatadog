@@ -80,7 +80,7 @@ pub trait NotifyTarget: Sync + Send + Sized + Hash + Eq + Clone + Debug {
 }
 
 pub trait MultiTargetHandlers<S> {
-    fn fetched(&self, target: &Arc<Target>, files: &[Arc<S>]) -> (Option<String>, bool);
+    fn fetched(&self, runtime_id: &Arc<String>, target: &Arc<Target>, files: &[Arc<S>]) -> (Option<String>, bool);
 
     fn expired(&self, target: &Arc<Target>);
 
@@ -364,10 +364,11 @@ where
                 .run(
                     this.storage.clone(),
                     Box::new(move |files| {
+                        let runtime_id = Arc::new(inner_fetcher.runtime_id.lock().unwrap().clone());
                         let (error, notify) = inner_this
                             .storage
                             .storage
-                            .fetched(&inner_fetcher.target, files);
+                            .fetched(&runtime_id, &inner_fetcher.target, files);
 
                         if notify {
                             // notify_targets is Hash + Eq + Clone, allowing us to deduplicate. Also
@@ -506,6 +507,7 @@ mod tests {
     impl MultiTargetHandlers<RcPathStore> for MultiFileStorage {
         fn fetched(
             &self,
+            _runtime_id: &Arc<String>,
             target: &Arc<Target>,
             files: &[Arc<RcPathStore>],
         ) -> (Option<String>, bool) {
