@@ -83,8 +83,6 @@ jobs:
           - platform: "ubuntu-latest"
             rust_version: "${RUST_VERSION}"
     steps:
-      - name: Setup tmate session
-        uses: mxschmitt/action-tmate@v3
       - name: "(Windows) Install nasm"
         if: matrix.platform == 'windows-latest'
         uses: ilammy/setup-nasm@v1
@@ -186,6 +184,10 @@ jobs:
             cmake -S .. -DDatadog_ROOT=$OUTPUT_FOLDER/profiling
             cmake --build .
           fi
+      - name: Setup tmate session
+        if: (success() || failure())
+        uses: mxschmitt/action-tmate@v3
+
 
   cross-centos7:
     name: build and test using cross - on centos7
