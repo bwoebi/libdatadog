@@ -83,10 +83,8 @@ jobs:
           - platform: "ubuntu-latest"
             rust_version: "${RUST_VERSION}"
     steps:
-      - name: Setup upterm session
-        uses: lhotari/action-upterm@v1
-        with:
-          limit-access-to-actor: true
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3
       - name: "(Windows) Install nasm"
         if: matrix.platform == 'windows-latest'
         uses: ilammy/setup-nasm@v1
